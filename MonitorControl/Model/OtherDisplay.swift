@@ -5,6 +5,7 @@ import IOKit
 import os.log
 
 class OtherDisplay: Display {
+  var lgIP = "10.0.10.206"
   var ddc: IntelDDC?
   var arm64ddc: Bool = false
   var arm64avService: IOAVService?
@@ -378,14 +379,30 @@ class OtherDisplay: Display {
   }
 
   public func writeDDCValues(command: Command, value: UInt16) {
-    guard app.sleepID == 0, app.reconfigureID == 0, !self.readPrefAsBool(key: .forceSw), !self.readPrefAsBool(key: .unavailableDDC, for: command) else {
-      return
-    }
-    self.writeDDCQueue.async(flags: .barrier) {
-      self.writeDDCNextValue[command] = value
-    }
-    DisplayManager.shared.globalDDCQueue.async(flags: .barrier) {
-      self.asyncPerformWriteDDCValues(command: command)
+    do {
+      switch command {
+      case .brightness:
+        try LGTVClient.setBrightness(ip: self.lgIP, brightness: Int(value))
+
+      case .audioSpeakerVolume:
+        try LGTVClient.setVolume(ip: self.lgIP, volume: Int(value))
+
+      default:
+        guard app.sleepID == 0, app.reconfigureID == 0,
+              !self.readPrefAsBool(key: .forceSw),
+              !self.readPrefAsBool(key: .unavailableDDC, for: command)
+        else {
+          return
+        }
+        self.writeDDCQueue.async(flags: .barrier) {
+          self.writeDDCNextValue[command] = value
+        }
+        DisplayManager.shared.globalDDCQueue.async(flags: .barrier) {
+          self.asyncPerformWriteDDCValues(command: command)
+        }
+      }
+    } catch {
+      os_log("Failed to control tv", type: .error)
     }
   }
 
@@ -418,28 +435,45 @@ class OtherDisplay: Display {
     }
   }
 
-  func readDDCValues(for command: Command, tries: UInt, minReplyDelay delay: UInt64?) -> (current: UInt16, max: UInt16)? {
+  func readDDCValues(
+    for command: Command, tries: UInt, minReplyDelay delay: UInt64?
+  ) -> (current: UInt16, max: UInt16)? {
     var values: (UInt16, UInt16)?
-    guard app.sleepID == 0, app.reconfigureID == 0, !self.readPrefAsBool(key: .forceSw), !self.readPrefAsBool(key: .unavailableDDC, for: command) else {
-      return values
-    }
-    let controlCodes = self.getRemapControlCodes(command: command)
-    let controlCode = controlCodes.count == 0 ? command.rawValue : controlCodes[0]
-    if Arm64DDC.isArm64 {
-      guard self.arm64ddc else {
-        return nil
-      }
-      DisplayManager.shared.globalDDCQueue.sync {
-        if let unwrappedDelay = delay {
-          values = Arm64DDC.read(service: self.arm64avService, command: controlCode, readSleepTime: UInt32(unwrappedDelay / 1000), numOfRetryAttemps: UInt8(min(tries, 255)))
+    do {
+      switch command {
+      case .brightness:
+        values = try (UInt16(LGTVClient.getBrightness(ip: self.lgIP)), 1)
+
+      case .audioSpeakerVolume:
+        values = try (UInt16(LGTVClient.getVolume(ip: self.lgIP)), 1)
+
+      default:
+        guard app.sleepID == 0, app.reconfigureID == 0, !self.readPrefAsBool(key: .forceSw), !self.readPrefAsBool(key: .unavailableDDC, for: command) else {
+          return values
+        }
+        let controlCodes = self.getRemapControlCodes(command: command)
+        let controlCode = controlCodes.count == 0 ? command.rawValue : controlCodes[0]
+        if Arm64DDC.isArm64 {
+          guard self.arm64ddc else {
+            return nil
+          }
+          DisplayManager.shared.globalDDCQueue.sync {
+            if let unwrappedDelay = delay {
+              values = Arm64DDC.read(service: self.arm64avService, command: controlCode, readSleepTime: UInt32(unwrappedDelay / 1000), numOfRetryAttemps: UInt8(min(tries, 255)))
+            } else {
+              values = Arm64DDC.read(service: self.arm64avService, command: controlCode, numOfRetryAttemps: UInt8(min(tries, 255)))
+            }
+          }
         } else {
-          values = Arm64DDC.read(service: self.arm64avService, command: controlCode, numOfRetryAttemps: UInt8(min(tries, 255)))
+          DisplayManager.shared.globalDDCQueue.sync {
+            values = self.ddc?.read(command: controlCode, tries: tries, minReplyDelay: delay)
+          }
         }
       }
-    } else {
-      DisplayManager.shared.globalDDCQueue.sync {
-        values = self.ddc?.read(command: controlCode, tries: tries, minReplyDelay: delay)
-      }
+    } catch {
+      os_log("Failed to control tv", type: .error)
+      print("\(error)")
+      values = (0, 1)
     }
     return values
   }
@@ -484,27 +518,47 @@ class OtherDisplay: Display {
     if self.readPrefAsBool(key: .invertDDC, for: command) {
       value = 1 - value
     }
-    let curveMultiplier = self.getCurveMultiplier(self.readPrefAsInt(key: .curveDDC, for: command))
-    let minDDCValue = Float(self.readPrefAsInt(key: .minDDCOverride, for: command))
+    let curveMultiplier = self.getCurveMultiplier(
+      self.readPrefAsInt(key: .curveDDC, for: command))
+    let minDDCValue = Float(
+      self.readPrefAsInt(key: .minDDCOverride, for: command))
     let maxDDCValue = Float(self.readPrefAsInt(key: .maxDDC, for: command))
     let curvedValue = pow(max(min(value, 1), 0), curveMultiplier)
-    let deNormalizedValue = (maxDDCValue - minDDCValue) * curvedValue + minDDCValue
-    var intDDCValue = UInt16(min(max(deNormalizedValue, minDDCValue), maxDDCValue))
+    let deNormalizedValue =
+      (maxDDCValue - minDDCValue) * curvedValue + minDDCValue
+    var intDDCValue = UInt16(
+      min(max(deNormalizedValue, minDDCValue), maxDDCValue))
     if from > 0, command == Command.audioSpeakerVolume {
       intDDCValue = max(1, intDDCValue) // Never let sound to mute accidentally, keep it digitally to at digital 1 if needed as muting breaks some displays
+    }
+    if from > 0, command == Command.audioSpeakerVolume {
+      intDDCValue = UInt16(from * 100)
+    }
+    if from > 0, command == Command.brightness {
+      intDDCValue = UInt16(from * 100)
     }
     return intDDCValue
   }
 
   func convDDCToValue(for command: Command, from: UInt16) -> Float {
-    let curveMultiplier = self.getCurveMultiplier(self.readPrefAsInt(key: .curveDDC, for: command))
-    let minDDCValue = Float(self.readPrefAsInt(key: .minDDCOverride, for: command))
+    let curveMultiplier = self.getCurveMultiplier(
+      self.readPrefAsInt(key: .curveDDC, for: command))
+    let minDDCValue = Float(
+      self.readPrefAsInt(key: .minDDCOverride, for: command))
     let maxDDCValue = Float(self.readPrefAsInt(key: .maxDDC, for: command))
-    let normalizedValue = ((min(max(Float(from), minDDCValue), maxDDCValue) - minDDCValue) / (maxDDCValue - minDDCValue))
+    let normalizedValue =
+      ((min(max(Float(from), minDDCValue), maxDDCValue) - minDDCValue)
+          / (maxDDCValue - minDDCValue))
     let deCurvedValue = pow(normalizedValue, 1.0 / curveMultiplier)
     var value = deCurvedValue
     if self.readPrefAsBool(key: .invertDDC, for: command) {
       value = 1 - value
+    }
+    if from > 0, command == Command.audioSpeakerVolume {
+      value = Float(from) / 100.0
+    }
+    if from > 0, command == Command.brightness {
+      value = Float(from) / 100.0
     }
     return max(min(value, 1), 0)
   }
